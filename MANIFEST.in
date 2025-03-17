@@ -1,0 +1,8 @@
+include LICENSE
+include README.md
+include requirements.txt
+include pwnai/models.yaml
+recursive-include pwnai/tools *.py
+recursive-include pwnai/utils *.py
+recursive-include pwnai/core *.py
+recursive-include pwnai/agents *.py 

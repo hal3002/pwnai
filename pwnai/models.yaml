@@ -1,0 +1,30 @@
+# PwnAI Model Configuration
+# Define different model providers and configurations
+
+openai:
+  url: https://api.openai.com/v1
+  model: gpt-4o
+  temperature: 0.2
+  system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges."
+  default: true
+
+ollama:
+  url: http://host.docker.internal:11434/api/chat
+  model: qwq:32b
+  temperature: 0.2
+  num_ctx: 16384
+  system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges."
+
+ollama_small:
+  url: http://host.docker.internal:11434/api/chat
+  model: llama3.2:3b
+  temperature: 0.2
+  num_ctx: 16384
+  system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges."
+
+gemma3:
+  url: http://host.docker.internal:11434/api/chat
+  model: gemma3:27b
+  temperature: 0.2
+  num_ctx: 16384
+  system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges." 
