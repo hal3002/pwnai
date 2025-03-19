@@ -10,9 +10,12 @@ import sys
 import yaml
 import importlib.resources
 from pathlib import Path
+import re
 
 from pwnai.core.coordinator import Coordinator
 from pwnai.utils.logger import setup_logger
+from pwnai.agents import ReversingAgent, DebuggingAgent, ExploitationAgent, WriteupAgent
+from pwnai.utils.llm_service import LLMService
 
 
 def parse_args():
@@ -51,6 +54,16 @@ def parse_args():
         "--model",
         type=str,
         help="LLM model configuration to use (e.g., 'openai', 'ollama'). Uses default from models.yaml if not specified",
+    )
+    parser.add_argument(
+        "--feedback",
+        type=str,
+        help="User feedback about the challenge goal (e.g., 'The goal is to get the binary to print \"You win!\"')",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        help="Path to the source code file of the binary (if available)",
     )
 
     return parser.parse_args()
@@ -104,13 +117,50 @@ def get_available_models():
         return ["openai"]  # Fallback to default
 
 
+def fix_exploit_files(output_dir: Path) -> None:
+    """
+    Fix any existing exploit.py files with incorrect process() calls.
+    
+    Args:
+        output_dir: Directory containing the exploit files
+    """
+    exploit_file = output_dir / "exploit.py"
+    
+    if not exploit_file.exists():
+        return
+        
+    try:
+        with open(exploit_file, 'r') as f:
+            content = f.read()
+            
+        # Fix common issues with process() calls
+        fixed_content = re.sub(
+            r'process\s*\(\s*context\.binary\s*\)', 
+            r'process([context.binary.path])', 
+            content
+        )
+        fixed_content = re.sub(
+            r'process\s*\(\s*[\'"](.+?)[\'"]\s*\)', 
+            r'process([\1])', 
+            fixed_content
+        )
+        
+        # Only write back if changes were made
+        if fixed_content != content:
+            with open(exploit_file, 'w') as f:
+                f.write(fixed_content)
+            logger.info(f"Fixed process() calls in {exploit_file}")
+    except Exception as e:
+        logger.warning(f"Failed to fix process() calls in {exploit_file}: {e}")
+
+
 def main():
     """Main entry point for PwnAI."""
     args = parse_args()
     
     # Setup logging
     log_level = logging.DEBUG if args.debug else logging.INFO
-    logger = setup_logger(log_level)
+    logger = setup_logger(level=log_level)
     
     logger.info("Starting PwnAI")
     
@@ -144,21 +194,81 @@ def main():
     # Initialize the coordinator
     try:
         coordinator = Coordinator(
-            binary_path=binary_path,
-            output_dir=output_dir,
+            binary_path=str(binary_path),
+            output_dir=str(output_dir),
             remote_host=remote_host,
             remote_port=remote_port,
             arch=args.arch,
             llm_config=llm_config,
+            debug=args.debug,
+            user_feedback=args.feedback,
+            source_file=args.source
         )
+        
+        # Initialize and register all agents
+        logger.info("Initializing agents...")
+        
+        # Create initial state for agents
+        state = coordinator.state.to_dict()
+        
+        # Create a single LLM service instance to be shared by all agents
+        shared_llm_service = LLMService(**(llm_config))
+        logger.debug(f"Created shared LLM service with model config: {args.model or 'default'}")
+        
+        # Pass the shared_llm_service directly to the agent constructors
+        
+        # Reversing Agent
+        reversing_agent = ReversingAgent(
+            state=state,
+            binary_path=binary_path,
+            output_dir=output_dir,
+            llm_config=llm_config,
+            llm_service=shared_llm_service
+        )
+        coordinator.register_agent("reversing", reversing_agent)
+        
+        # Debugging Agent
+        debugging_agent = DebuggingAgent(
+            state=state,
+            binary_path=binary_path,
+            output_dir=output_dir,
+            llm_config=llm_config,
+            llm_service=shared_llm_service
+        )
+        coordinator.register_agent("debugging", debugging_agent)
+        
+        # Exploitation Agent
+        exploitation_agent = ExploitationAgent(
+            state=state,
+            binary_path=binary_path,
+            output_dir=output_dir,
+            llm_config=llm_config,
+            llm_service=shared_llm_service
+        )
+        coordinator.register_agent("exploitation", exploitation_agent)
+        
+        # Writeup Agent
+        writeup_agent = WriteupAgent(
+            state=state,
+            binary_path=binary_path,
+            output_dir=output_dir,
+            llm_config=llm_config,
+            llm_service=shared_llm_service
+        )
+        coordinator.register_agent("writeup", writeup_agent)
+        
+        logger.info("All agents initialized and registered")
         
         # Start the exploitation process
         result = coordinator.start()
         
+        # Fix any exploit files that might have been generated
+        fix_exploit_files(output_dir)
+        
         logger.info(f"Exploitation completed. Check {output_dir} for results.")
         
-        if result.flag:
-            logger.info(f"Flag found: {result.flag}")
+        if result.get('flag'):
+            logger.info(f"Flag found: {result['flag']}")
         
         return 0
     

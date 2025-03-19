@@ -28,6 +28,7 @@ class WriteupAgent(BaseAgent):
         binary_path: Path,
         output_dir: Path,
         llm_config: Optional[Dict[str, Any]] = None,
+        llm_service: Optional[LLMService] = None,
     ):
         """
         Initialize the Writeup Agent.
@@ -37,59 +38,51 @@ class WriteupAgent(BaseAgent):
             binary_path: Path to the target binary
             output_dir: Directory to store output files
             llm_config: Configuration for the LLM
+            llm_service: Optional shared LLM service instance
         """
-        super().__init__(state, binary_path, output_dir, llm_config)
+        super().__init__(state, binary_path, output_dir, llm_config, llm_service)
         
-        # Initialize LLM service
-        llm_system_prompt = """
-        You are an expert binary exploitation documentalist. Your job is to create detailed, 
-        educational writeups for Capture The Flag (CTF) challenges. These writeups should explain 
-        the entire process of identifying, analyzing, and exploiting vulnerabilities in binaries.
-        
-        Your writeups should be clear, comprehensive, and follow a logical progression. They should 
-        provide enough detail that someone with basic knowledge of binary exploitation could understand 
-        and learn from the explanation. Include:
-        
-        1. Initial analysis and discovery of the vulnerability
-        2. A technical explanation of the vulnerability
-        3. The process of developing the exploit
-        4. The final exploit and how it works
-        5. General lessons that can be applied to similar challenges
-        
-        Use a professional yet accessible tone, and organize the content with clear sections and headings.
-        """
-        
-        self.llm = LLMService(
-            system_prompt=llm_system_prompt,
-            **(llm_config or {})
-        )
+        # Initialize LLM service if not provided
+        if self.llm_service is None:
+            llm_system_prompt = """
+            You are an expert binary exploitation documentalist. Your job is to create detailed, 
+            educational writeups for Capture The Flag (CTF) challenges. These writeups should explain 
+            the entire process of identifying, analyzing, and exploiting vulnerabilities in binaries.
+            
+            Your writeups should be clear, comprehensive, and follow a logical progression. They should 
+            provide enough detail that someone with basic knowledge of binary exploitation could understand 
+            and learn from the explanation. Include:
+            
+            1. Initial analysis and discovery of the vulnerability
+            2. A technical explanation of the vulnerability
+            3. The process of developing the exploit
+            4. The final exploit and how it works
+            5. General lessons that can be applied to similar challenges
+            
+            Use a professional yet accessible tone, and organize the content with clear sections and headings.
+            """
+            
+            self.llm = LLMService(
+                system_prompt=llm_system_prompt,
+                **(llm_config or {})
+            )
+        else:
+            self.llm = self.llm_service
+            
+        # For compatibility with some methods that expect a model parameter
+        self.model = None
     
     def run(self) -> Dict[str, Any]:
         """
-        Generate a detailed writeup of the exploitation process.
+        Generate a solution writeup.
         
         Returns:
-            Updated state dictionary with writeup information
+            Dictionary containing the writeup
         """
         self.logger.info("Generating exploitation writeup")
         
-        # Collect all the information from the state
-        binary_info = self._collect_binary_info()
-        vulnerability_info = self._collect_vulnerability_info()
-        debugging_info = self._collect_debugging_info()
-        exploitation_info = self._collect_exploitation_info()
-        
-        # Generate the writeup sections
-        sections = {
-            "introduction": self._generate_introduction(binary_info),
-            "vulnerability_analysis": self._generate_vulnerability_analysis(vulnerability_info),
-            "exploitation_process": self._generate_exploitation_process(debugging_info, exploitation_info),
-            "final_exploit": self._generate_final_exploit(exploitation_info),
-            "conclusion": self._generate_conclusion(binary_info, vulnerability_info),
-        }
-        
-        # Combine sections into a complete writeup
-        writeup = self._combine_sections(sections)
+        # Generate the main writeup
+        writeup = self._generate_writeup()
         
         # Save the writeup to disk
         writeup_path = self.output_dir / "writeup.md"
@@ -98,21 +91,132 @@ class WriteupAgent(BaseAgent):
         
         self.logger.info(f"Saved writeup to {writeup_path}")
         
-        # Generate a shorter summary version
+        # Generate a summary for easy reference
         summary = self._generate_summary(writeup)
+        
+        # Save the summary to disk
         summary_path = self.output_dir / "writeup_summary.md"
         with open(summary_path, "w") as f:
             f.write(summary)
         
         self.logger.info(f"Saved summary writeup to {summary_path}")
         
-        # Update state with writeup information
+        # Update state with the writeup
         self.update_state({
             "writeup": writeup,
-            "writeup_summary": summary,
+            "writeup_summary": summary
         })
         
         return self.state
+    
+    def _read_file(self, path: Path) -> str:
+        """
+        Read a file safely, returning empty string if file not found.
+        
+        Args:
+            path: Path to the file
+            
+        Returns:
+            File contents as string, or empty string if file not found
+        """
+        try:
+            if path.exists():
+                with open(path, "r") as f:
+                    return f.read()
+            else:
+                self.logger.warning(f"File not found: {path}")
+                return "[File not available]"
+        except Exception as e:
+            self.logger.error(f"Error reading file {path}: {str(e)}")
+            return f"[Error reading file: {str(e)}]"
+    
+    def _generate_writeup(self) -> str:
+        """
+        Generate a comprehensive writeup of the exploitation process.
+        
+        Returns:
+            Markdown-formatted writeup
+        """
+        # Collect all available information
+        binary_path = self.state.get("binary_path", "unknown")
+        binary_arch = self.state.get("architecture", {})
+        security_features = self.state.get("security_features", {})
+        vulnerabilities = self.state.get("vulnerabilities", [])
+        vulnerability_type = self.state.get("vulnerability_type", "unknown")
+        exploitation_plan = self._read_file(self.output_dir / "exploitation_plan.txt")
+        debug_analysis = self._read_file(self.output_dir / "debug_analysis.txt")
+        reversing_analysis = self._read_file(self.output_dir / "vulnerability_analysis.txt")
+        exploit_code = self._read_file(self.output_dir / "exploit.py")
+        exploit_success = self.state.get("exploit_successful", False)
+        flag = self.state.get("flag", "Not found")
+        
+        # Read source file if available
+        source_code = self.read_source_file()
+        source_section = ""
+        if source_code:
+            source_section = f"""
+        ## SOURCE CODE
+        ```c
+        {source_code}
+        ```
+        """
+        
+        # Format information for the LLM prompt
+        prompt = f"""
+        Please write a detailed CTF writeup for the binary {os.path.basename(binary_path)}.
+        Include all the necessary sections such as introduction, vulnerability analysis, 
+        exploitation process, and conclusion.
+        
+        Here's the information I have:
+        
+        ## BINARY INFO
+        - Architecture: {binary_arch.get("arch", "unknown")} {binary_arch.get("bits", "")}
+        - Security Features:
+          - NX: {security_features.get("nx", "unknown")}
+          - Canary: {security_features.get("canary", "unknown")}
+          - PIE: {security_features.get("pie", "unknown")}
+          - RELRO: {security_features.get("relro", "unknown")}
+        
+        ## VULNERABILITIES
+        - Primary vulnerability: {vulnerability_type}
+        - Vulnerability details follow below in the analysis sections
+        {source_section}
+        ## STATIC ANALYSIS
+        {reversing_analysis}
+        
+        ## DYNAMIC ANALYSIS
+        {debug_analysis}
+        
+        ## EXPLOITATION PLAN
+        {exploitation_plan}
+        
+        ## EXPLOIT CODE
+        ```python
+        {exploit_code}
+        ```
+        
+        ## RESULT
+        - Exploit success: {exploit_success}
+        - Flag: {flag}
+        
+        Format the writeup in markdown with appropriate sections, code blocks, and explanations.
+        Make sure to detail the entire process from initial analysis to exploitation.
+        Include any relevant addresses, offsets, and techniques used.
+        Explain why certain approaches were taken and how they relate to the binary's security measures.
+        """
+        
+        # Incorporate user feedback if available
+        prompt = self.incorporate_feedback(prompt)
+        
+        # If we have specific vulnerabilities, incorporate the feedback from the first one
+        if vulnerabilities and isinstance(vulnerabilities[0], dict):
+            prompt = self.incorporate_vulnerability_feedback(prompt, vulnerabilities[0])
+        
+        # Call LLM
+        self.logger.info("Generating writeup...")
+        writeup = self.llm.call(prompt, model=self.model)
+        
+        return writeup
     
     def _collect_binary_info(self) -> Dict[str, Any]:
         """

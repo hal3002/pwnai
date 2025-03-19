@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from pwnai.agents.base_agent import BaseAgent
 from pwnai.tools.radare2 import Radare2
 from pwnai.utils.llm_service import LLMService
+from pwnai.utils.logger import setup_logger
 
 
 class ReversingAgent(BaseAgent):
@@ -28,6 +29,7 @@ class ReversingAgent(BaseAgent):
         binary_path: Path,
         output_dir: Path,
         llm_config: Optional[Dict[str, Any]] = None,
+        llm_service: Optional[LLMService] = None,
     ):
         """
         Initialize the Reversing Agent.
@@ -37,40 +39,47 @@ class ReversingAgent(BaseAgent):
             binary_path: Path to the target binary
             output_dir: Directory to store output files
             llm_config: Configuration for the LLM
+            llm_service: Optional shared LLM service instance
         """
-        super().__init__(state, binary_path, output_dir, llm_config)
+        super().__init__(state, binary_path, output_dir, llm_config, llm_service)
         
         # Initialize Radare2 wrapper
         self.r2 = Radare2(binary_path)
         
-        # Initialize LLM service
-        llm_system_prompt = """
-        You are a binary exploitation and reverse engineering expert. You have deep knowledge of 
-        assembly, binary formats (ELF, etc.), memory corruption vulnerabilities, and exploitation techniques.
+        # Initialize LLM service if not provided
+        if self.llm_service is None:
+            llm_system_prompt = """
+            You are a binary exploitation and reverse engineering expert. You have deep knowledge of 
+            assembly, binary formats (ELF, etc.), memory corruption vulnerabilities, and exploitation techniques.
+            
+            You are given information about a binary that needs to be analyzed for vulnerabilities. 
+            Thoroughly analyze the provided disassembly, strings, symbols, and other information.
+            Focus on identifying potential vulnerabilities such as:
+            
+            1. Buffer overflows (look for unbounded input functions like gets, strcpy, etc.)
+            2. Format string vulnerabilities (printf with user-controlled format string)
+            3. Integer overflows
+            4. Use-after-free issues
+            5. Logic bugs or hardcoded credentials
+            
+            For each potential vulnerability, identify:
+            - The type of vulnerability
+            - The location (function, address)
+            - The input vector (how user input reaches the vulnerability)
+            - Any relevant constraints or security mitigations
+            
+            Return your analysis in a structured format that explains the findings clearly.
+            """
+            
+            self.llm = LLMService(
+                system_prompt=llm_system_prompt,
+                **(llm_config or {})
+            )
+        else:
+            self.llm = self.llm_service
         
-        You are given information about a binary that needs to be analyzed for vulnerabilities. 
-        Thoroughly analyze the provided disassembly, strings, symbols, and other information.
-        Focus on identifying potential vulnerabilities such as:
-        
-        1. Buffer overflows (look for unbounded input functions like gets, strcpy, etc.)
-        2. Format string vulnerabilities (printf with user-controlled format string)
-        3. Integer overflows
-        4. Use-after-free issues
-        5. Logic bugs or hardcoded credentials
-        
-        For each potential vulnerability, identify:
-        - The type of vulnerability
-        - The location (function, address)
-        - The input vector (how user input reaches the vulnerability)
-        - Any relevant constraints or security mitigations
-        
-        Return your analysis in a structured format that explains the findings clearly.
-        """
-        
-        self.llm = LLMService(
-            system_prompt=llm_system_prompt,
-            **(llm_config or {})
-        )
+        # Set up logging
+        self.logger = setup_logger(name=f"pwnai.{self.__class__.__name__}")
     
     def run(self) -> Dict[str, Any]:
         """
@@ -99,9 +108,9 @@ class ReversingAgent(BaseAgent):
         
         # Log key findings
         self.logger.info(f"Architecture: {arch_info['arch']} {arch_info['bits']}-bit")
-        self.logger.info(f"Security features: NX={'nx' in security_features}, "
-                         f"Canary={'canary' in security_features}, "
-                         f"PIE={'pie' in security_features}, "
+        self.logger.info(f"Security features: NX={security_features.get('nx', False)}, "
+                         f"Canary={security_features.get('canary', False)}, "
+                         f"PIE={security_features.get('pie', False)}, "
                          f"RELRO={security_features.get('relro', 'No')}")
         
         # Create reversing report for LLM analysis
@@ -126,6 +135,9 @@ class ReversingAgent(BaseAgent):
         
         # Extract vulnerability info from LLM response
         vulnerabilities = self._extract_vulnerabilities(vulnerability_analysis)
+        
+        # Consolidate similar vulnerabilities to reduce redundancy
+        vulnerabilities = self._consolidate_vulnerabilities(vulnerabilities)
         
         # Update state with findings
         self.update_state({
@@ -261,6 +273,12 @@ class ReversingAgent(BaseAgent):
             main_disassembly=report.get("main_disassembly", report.get("entry_disassembly", "No disassembly available"))
         )
         
+        # Incorporate user feedback if available
+        formatted_prompt = self.incorporate_feedback(formatted_prompt)
+        
+        # Incorporate source file if available
+        formatted_prompt = self.incorporate_source(formatted_prompt)
+        
         # Call LLM
         self.logger.debug("Sending analysis request to LLM")
         response = self.llm.call(formatted_prompt)
@@ -355,3 +373,132 @@ class ReversingAgent(BaseAgent):
                             })
         
         return vulnerabilities 
+    
+    def _consolidate_vulnerabilities(self, vulnerabilities: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        Consolidate similar vulnerabilities to reduce redundancy.
+        
+        This method groups vulnerabilities by type and location, merging those
+        that are likely referring to the same underlying issue.
+        
+        Args:
+            vulnerabilities: List of extracted vulnerabilities
+            
+        Returns:
+            Consolidated list of vulnerabilities
+        """
+        if not vulnerabilities:
+            return []
+            
+        self.logger.info(f"Consolidating {len(vulnerabilities)} vulnerabilities")
+        
+        # Group vulnerabilities by type
+        grouped_by_type = {}
+        for vuln in vulnerabilities:
+            vuln_type = vuln.get("type", "unknown").lower()
+            if vuln_type not in grouped_by_type:
+                grouped_by_type[vuln_type] = []
+            grouped_by_type[vuln_type].append(vuln)
+        
+        consolidated = []
+        
+        for vuln_type, vulns in grouped_by_type.items():
+            # If only one vulnerability of this type, add it as is
+            if len(vulns) == 1:
+                consolidated.append(vulns[0])
+                continue
+                
+            # Group by location/function
+            by_location = {}
+            for vuln in vulns:
+                # Create a location key based on function or address
+                location_key = "unknown"
+                if "function" in vuln:
+                    location_key = vuln["function"]
+                elif "address" in vuln:
+                    location_key = vuln["address"]
+                elif "location" in vuln:
+                    # Try to extract function/address from location string
+                    location = vuln["location"].lower()
+                    if "function" in location and ":" in location:
+                        location_key = location.split(":", 1)[1].strip()
+                    elif "address" in location and ":" in location:
+                        location_key = location.split(":", 1)[1].strip()
+                    else:
+                        location_key = location[:50]  # Use part of location as key
+                
+                if location_key not in by_location:
+                    by_location[location_key] = []
+                by_location[location_key].append(vuln)
+            
+            # For each location, merge vulnerabilities
+            for location, loc_vulns in by_location.items():
+                if len(loc_vulns) == 1:
+                    consolidated.append(loc_vulns[0])
+                else:
+                    # Merge multiple vulnerabilities at same location
+                    merged = self._merge_vulnerabilities(loc_vulns)
+                    consolidated.append(merged)
+        
+        # Sort consolidated vulnerabilities by type for consistency
+        consolidated.sort(key=lambda x: x.get("type", "").lower())
+        
+        self.logger.info(f"Consolidated down to {len(consolidated)} unique vulnerabilities")
+        return consolidated
+    
+    def _merge_vulnerabilities(self, vulns: List[Dict[str, str]]) -> Dict[str, str]:
+        """
+        Merge multiple vulnerability dictionaries into one comprehensive entry.
+        
+        Args:
+            vulns: List of vulnerability dictionaries to merge
+            
+        Returns:
+            Merged vulnerability dictionary
+        """
+        if not vulns:
+            return {}
+        if len(vulns) == 1:
+            return vulns[0]
+            
+        # Start with the most detailed vulnerability as base
+        # (the one with the most fields)
+        base = max(vulns, key=lambda x: len(x))
+        merged = base.copy()
+        
+        # Create a combined description
+        descriptions = []
+        for vuln in vulns:
+            if "description" in vuln and vuln["description"] not in descriptions:
+                descriptions.append(vuln["description"])
+        
+        if descriptions:
+            merged["description"] = "\n\n".join(descriptions)
+            
+        # Combine exploitation information
+        exploitation_info = []
+        for vuln in vulns:
+            if "exploitation" in vuln and vuln["exploitation"] not in exploitation_info:
+                exploitation_info.append(vuln["exploitation"])
+        
+        if exploitation_info:
+            merged["exploitation"] = "\n\n".join(exploitation_info)
+            
+        # Combine constraint information
+        constraint_info = []
+        for vuln in vulns:
+            if "constraints" in vuln and vuln["constraints"] not in constraint_info:
+                constraint_info.append(vuln["constraints"])
+                
+        if constraint_info:
+            merged["constraints"] = "\n\n".join(constraint_info)
+            
+        # Generate a consolidated type if needed
+        if "type" not in merged or merged["type"].lower() == "unknown":
+            # Extract type from the first vulnerability that has one
+            for vuln in vulns:
+                if "type" in vuln and vuln["type"].lower() != "unknown":
+                    merged["type"] = vuln["type"]
+                    break
+        
+        return merged 

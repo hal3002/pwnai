@@ -6,7 +6,6 @@ openai:
   model: gpt-4o
   temperature: 0.2
   system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges."
-  default: true
 
 ollama:
   url: http://host.docker.internal:11434/api/chat
@@ -27,4 +26,13 @@ gemma3:
   model: gemma3:27b
   temperature: 0.2
   num_ctx: 16384
+  system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges."
+
+claude:
+  url: https://api.anthropic.com/v1/messages
+  model: claude-3-7-sonnet-20250219
+  temperature: 0.2
   system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges." 
+  # Uncomment and set your Anthropic API key here
+  # api_key: your_api_key_here
+  default: true

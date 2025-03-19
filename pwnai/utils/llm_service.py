@@ -7,6 +7,8 @@ import logging
 import os
 import yaml
 import requests
+import time
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -14,6 +16,8 @@ import openai
 from openai import OpenAI
 from pwnai.utils.logger import setup_logger
 
+# Dictionary to store existing LLM service instances by config
+_llm_service_cache = {}
 
 class LLMService:
     """
@@ -23,11 +27,35 @@ class LLMService:
     the context and prompt formatting.
     """
     
+    def __new__(
+        cls,
+        model_config: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        config_path: Optional[str] = None,
+    ):
+        """
+        Create or reuse an LLMService instance based on the configuration.
+        
+        This implements a singleton-like pattern, where we reuse instances
+        with the same model_config.
+        """
+        # Create a cache key based on the configuration
+        cache_key = f"{model_config}:{config_path}"
+        
+        # If we already have an instance with this configuration, return it
+        if cache_key in _llm_service_cache:
+            return _llm_service_cache[cache_key]
+        
+        # Otherwise, create a new instance
+        instance = super().__new__(cls)
+        _llm_service_cache[cache_key] = instance
+        return instance
+    
     def __init__(
         self,
         model_config: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        config_path: Optional[str] = "/opt/models.yaml",
+        config_path: Optional[str] = None,
     ):
         """
         Initialize the LLM service.
@@ -38,7 +66,15 @@ class LLMService:
             system_prompt: System prompt to use for all conversations
             config_path: Path to the model configuration YAML file
         """
+        # Check if this instance has already been initialized
+        if hasattr(self, 'initialized') and self.initialized:
+            return
+            
         self.logger = setup_logger(name="pwnai.LLMService")
+
+        # If config_path is not provided, look in standard locations
+        if config_path is None:
+            config_path = self._find_config_path()
         
         # Load configuration
         self.config = self._load_config(config_path)
@@ -74,6 +110,15 @@ class LLMService:
         self.api_key = self.model_config.get("api_key") or os.environ.get("OPENAI_API_KEY")
         if not self.api_key and self.provider == "openai":
             self.logger.warning("No OpenAI API key provided. LLM calls will fail.")
+            
+        # Set Anthropic API key if using Claude
+        self.anthropic_api_key = self.model_config.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")
+        if not self.anthropic_api_key and self.provider == "claude":
+            self.logger.warning("No Anthropic API key provided. LLM calls will fail.")
+            # Try to get from ANTHROPIC_API_KEY environment variable
+            self.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not self.anthropic_api_key:
+                self.logger.error("ANTHROPIC_API_KEY environment variable not set. Claude calls will fail.")
         
         # Initialize the client if using OpenAI
         self.client = None
@@ -94,6 +139,28 @@ class LLMService:
         ]
         
         self.logger.info(f"Initialized LLM service with provider: {self.provider}, model: {self.model}")
+        
+        # Mark this instance as initialized to avoid re-initialization
+        self.initialized = True
+    
+    def _find_config_path(self) -> str:
+        """Find the models.yaml configuration file."""
+        # Check current directory
+        if os.path.exists("models.yaml"):
+            return "models.yaml"
+        
+        # Check home directory ~/.pwnai/models.yaml
+        home_config = os.path.expanduser("~/.pwnai/models.yaml")
+        if os.path.exists(home_config):
+            return home_config
+        
+        # Check package directory
+        package_config = os.path.join(os.path.dirname(__file__), "../models.yaml")
+        if os.path.exists(package_config):
+            return package_config
+        
+        # Default to /opt as fallback
+        return "/opt/models.yaml"
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Load the model configuration from a YAML file."""
@@ -171,6 +238,8 @@ class LLMService:
             # Call the appropriate provider
             if self.provider == "openai":
                 return self._call_openai(messages, _model, _temperature, _max_tokens, with_history)
+            elif self.provider == "claude":
+                return self._call_anthropic(messages, _model, _temperature, _max_tokens, with_history)
             else:
                 return self._call_compatible_api(messages, _model, _temperature, _max_tokens, with_history)
         
@@ -202,6 +271,130 @@ class LLMService:
             self.conversation_history.append({"role": "assistant", "content": response_text})
         
         return response_text
+    
+    def _call_anthropic(
+        self,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        with_history: bool
+    ) -> str:
+        """Call the Anthropic API with Claude-specific formatting."""
+        if not self.anthropic_api_key:
+            error_msg = "No Anthropic API key available. Please set ANTHROPIC_API_KEY environment variable."
+            self.logger.error(error_msg)
+            return f"Error: {error_msg}"
+            
+        # Set API headers according to Anthropic's documentation
+        headers = {
+            "Content-Type": "application/json",
+            "X-Api-Key": self.anthropic_api_key,
+            "anthropic-version": "2023-06-01"
+        }
+        
+        self.logger.debug(f"Using API key: {self.anthropic_api_key[:4]}...{self.anthropic_api_key[-4:] if self.anthropic_api_key else 'None'}")
+        
+        # Extract system message from the messages array
+        system_content = None
+        filtered_messages = []
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content = msg["content"]
+            else:
+                # Anthropic only accepts 'user' and 'assistant' roles
+                filtered_messages.append(msg)
+        
+        # Anthropic API payload format with system as top-level parameter
+        payload = {
+            "model": model,
+            "messages": filtered_messages,
+            "system": system_content,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        # Log the exact payload for debugging
+        self.logger.debug(f"Anthropic payload: {json.dumps(payload)[:500]}...")
+        
+        # Implement retry logic with exponential backoff
+        max_retries = 5
+        base_delay = 2  # Start with 2 second delay
+        
+        for retry in range(max_retries + 1):
+            try:
+                self.logger.debug(f"Sending request to Anthropic API with model {model}, attempt {retry+1}/{max_retries+1}")
+                
+                response = requests.post(
+                    self.url,
+                    json=payload,
+                    headers=headers,
+                    timeout=120
+                )
+                
+                # Handle successful response
+                if response.status_code == 200:
+                    response_data = response.json()
+                    
+                    # Extract response from Anthropic format
+                    if "content" in response_data and len(response_data["content"]) > 0:
+                        # Handle new Anthropic API format with content array
+                        content_parts = [part["text"] for part in response_data["content"] if part["type"] == "text"]
+                        response_text = "".join(content_parts)
+                    else:
+                        # Fallback for older API or unexpected format
+                        response_text = response_data.get("content", str(response_data))
+                    
+                    # Update conversation history if using history
+                    if with_history:
+                        self.conversation_history.append({"role": "user", "content": messages[-1]["content"]})
+                        self.conversation_history.append({"role": "assistant", "content": response_text})
+                    
+                    return response_text
+                
+                # Handle overloaded errors (529) with retry logic
+                elif response.status_code == 529:
+                    error_data = response.json()
+                    error_msg = f"API overloaded (attempt {retry+1}/{max_retries+1}): {error_data}"
+                    self.logger.warning(error_msg)
+                    
+                    if retry < max_retries:
+                        # Calculate delay with exponential backoff and jitter
+                        delay = base_delay * (2 ** retry) + random.uniform(0, 1)
+                        self.logger.info(f"Retrying in {delay:.2f} seconds...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # Last retry failed
+                        self.logger.error(f"Max retries exceeded for Anthropic API call")
+                        return f"Error: Anthropic API overloaded. Max retries exceeded."
+                
+                # Handle other errors
+                else:
+                    error_msg = f"API call failed with status code {response.status_code}: {response.text}"
+                    self.logger.error(error_msg)
+                    return f"Error: {error_msg}"
+                    
+            except requests.RequestException as e:
+                error_msg = f"Request failed: {str(e)}"
+                self.logger.error(error_msg)
+                
+                if retry < max_retries:
+                    # Calculate delay with exponential backoff and jitter
+                    delay = base_delay * (2 ** retry) + random.uniform(0, 1)
+                    self.logger.info(f"Retrying in {delay:.2f} seconds...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    return f"Error: {error_msg}"
+            except Exception as e:
+                error_msg = f"Unexpected error: {str(e)}"
+                self.logger.error(error_msg)
+                return f"Error: {error_msg}"
+        
+        # Should not reach here, but just in case
+        return "Error: Failed to get response from Anthropic API after retries."
     
     def _call_compatible_api(
         self,

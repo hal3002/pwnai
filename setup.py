@@ -15,6 +15,7 @@ setup(
         "requests",
         "capstone",
         "ropgadget",
+        "pwndbg",
     ],
     extras_require={
         "dev": [

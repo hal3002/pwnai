@@ -31,12 +31,12 @@ def test_coordinator_initialization(test_binary, test_output_dir):
         binary_path=test_binary,
         output_dir=test_output_dir,
     )
-    assert coordinator.binary_path == test_binary
-    assert coordinator.output_dir == test_output_dir
-    assert coordinator.remote_host is None
-    assert coordinator.remote_port is None
-    assert coordinator.arch is None
-    assert isinstance(coordinator.state, dict)
+    assert coordinator.state.binary_path == test_binary
+    assert coordinator.state.output_dir == test_output_dir
+    assert coordinator.state.remote_target is None
+    assert coordinator.state.arch is None
+    from pwnai.core.coordinator import PwnState
+    assert isinstance(coordinator.state, PwnState)
     
     # Test with remote host and port
     coordinator = Coordinator(
@@ -45,8 +45,7 @@ def test_coordinator_initialization(test_binary, test_output_dir):
         remote_host="localhost",
         remote_port=1337,
     )
-    assert coordinator.remote_host == "localhost"
-    assert coordinator.remote_port == 1337
+    assert coordinator.state.remote_target == "localhost:1337"
     
     # Test with custom arch
     coordinator = Coordinator(
@@ -54,7 +53,7 @@ def test_coordinator_initialization(test_binary, test_output_dir):
         output_dir=test_output_dir,
         arch="i386",
     )
-    assert coordinator.arch == "i386"
+    assert coordinator.state.arch == "i386"
     
     # Test with LLM config
     llm_config = {"model": "gpt-4", "temperature": 0.7}

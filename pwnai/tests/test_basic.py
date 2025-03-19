@@ -57,9 +57,9 @@ def test_coordinator_initialization():
     )
     
     assert coordinator is not None
-    assert coordinator.binary_path == binary_path
-    assert coordinator.output_dir == output_dir
-    assert coordinator.arch == "x86_64"
+    assert coordinator.state.binary_path == binary_path
+    assert coordinator.state.output_dir == output_dir
+    assert coordinator.state.arch == "x86_64"
 
 
 def test_find_models_config():

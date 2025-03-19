@@ -194,6 +194,33 @@ docker run -it --rm -v "$(pwd):/app" pwnai:dev
 
 The Docker environment includes all necessary dependencies for development and testing.
 
+## GDB with pwndbg
+
+PwnAI now includes [pwndbg](https://github.com/pwndbg/pwndbg) for enhanced binary analysis capabilities in GDB. When you run the setup script, pwndbg is automatically installed and configured.
+
+### Verifying pwndbg installation
+
+You can verify that pwndbg is correctly installed by running:
+
+```bash
+source ~/pwnai-env/bin/activate
+echo 'show version' | gdb -q
+```
+
+If pwndbg is properly installed, you should see the pwndbg banner and command list when GDB starts.
+
+### Useful pwndbg commands
+
+- `checksec` - Check binary security features
+- `vmmap` - Show memory map
+- `dps` - Dump memory with symbols
+- `nearpc` - Show disassembly around current instruction
+- `telescope` - Inspect memory in a pretty format
+- `hexdump` - Show memory as hex and ASCII
+- `context` - Show relevant information about current state
+
+See the [pwndbg documentation](https://github.com/pwndbg/pwndbg/blob/dev/FEATURES.md) for a full list of commands.
+
 ## Disclaimer
 
 This tool is designed for educational purposes and for solving legitimate CTF challenges. Users are responsible for ensuring they use this tool ethically and in compliance with applicable laws and regulations.
