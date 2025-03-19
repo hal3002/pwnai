@@ -32,6 +32,7 @@ class LLMService:
         model_config: Optional[str] = None,
         system_prompt: Optional[str] = None,
         config_path: Optional[str] = None,
+        agent_type: Optional[str] = None,
     ):
         """
         Create or reuse an LLMService instance based on the configuration.
@@ -40,7 +41,7 @@ class LLMService:
         with the same model_config.
         """
         # Create a cache key based on the configuration
-        cache_key = f"{model_config}:{config_path}"
+        cache_key = f"{model_config}:{config_path}:{agent_type}"
         
         # If we already have an instance with this configuration, return it
         if cache_key in _llm_service_cache:
@@ -56,52 +57,107 @@ class LLMService:
         model_config: Optional[str] = None,
         system_prompt: Optional[str] = None,
         config_path: Optional[str] = None,
+        agent_type: Optional[str] = None,
     ):
         """
         Initialize the LLM service.
         
         Args:
-            model_config: The model configuration to use (e.g., "openai", "ollama")
+            model_config: The model provider to use (e.g., "openai", "claude")
                           If None, the default from config will be used
             system_prompt: System prompt to use for all conversations
-            config_path: Path to the model configuration YAML file
+            config_path: Path to the configuration YAML file
+            agent_type: Type of agent (e.g., "reversing", "debugging") to use specific configuration
         """
         # Check if this instance has already been initialized
         if hasattr(self, 'initialized') and self.initialized:
             return
             
         self.logger = setup_logger(name="pwnai.LLMService")
+        self.agent_type = agent_type  # Store agent_type for reference
 
-        # If config_path is not provided, look in standard locations
-        if config_path is None:
+        # If config_path is provided, use it directly without searching
+        if config_path and os.path.exists(config_path):
+            self.logger.debug(f"Using provided config path: {config_path}")
+            # Expand user path for home directory reference (~)
+            if config_path.startswith("~"):
+                config_path = os.path.expanduser(config_path)
+        else:
+            # If config_path is not provided or doesn't exist, look in standard locations
             config_path = self._find_config_path()
+            if not config_path:
+                self.logger.warning("No configuration file found, using default settings")
         
         # Load configuration
         self.config = self._load_config(config_path)
-        if not self.config:
-            self.logger.error("Failed to load model configuration. Using OpenAI defaults.")
-            self.config = {
+        providers_config = self.config.get("providers", {})
+        agents_config = self.config.get("agents", {})
+        
+        if not providers_config:
+            self.logger.error("Failed to load provider configurations. Using OpenAI defaults.")
+            providers_config = {
                 "openai": {
                     "url": "https://api.openai.com/v1",
-                    "model": "gpt-4",
-                    "temperature": 0.7,
-                    "max_tokens": 4096,
                 }
             }
         
-        # Determine which model configuration to use
-        if model_config:
-            if model_config in self.config:
-                self.model_config = self.config[model_config]
-                self.provider = model_config
+        # First check if we should use agent-specific configuration
+        if agent_type and agent_type in agents_config:
+            # Get the agent-specific configuration
+            agent_config = agents_config[agent_type]
+            self.logger.info(f"Using agent-specific configuration for {agent_type}")
+            
+            # Get the provider specified for this agent
+            provider_name = agent_config.get("provider")
+            
+            if not provider_name:
+                self.logger.warning(f"No provider specified for agent {agent_type}, using agent config directly")
+                self.model_config = agent_config
+                self.provider = "unknown"
+            elif provider_name not in providers_config:
+                self.logger.warning(f"Provider '{provider_name}' not found, using agent config directly")
+                self.model_config = agent_config
+                self.provider = provider_name
             else:
-                self.logger.warning(f"Model configuration '{model_config}' not found. Using default.")
-                self.model_config, self.provider = self._get_default_config()
+                # Start with the provider's config (for URL, API settings)
+                self.model_config = providers_config[provider_name].copy()
+                # Add the agent-specific settings (model, temperature, etc.)
+                self.model_config.update(agent_config)
+                self.provider = provider_name
+                
+            self.logger.debug(f"Using provider '{self.provider}' for agent '{agent_type}'")
+            
+        # Otherwise, use model_config if provided (provider name)
+        elif model_config:
+            if model_config in providers_config:
+                # If a model_config is given but it's only a provider name, we need to look for defaults
+                self.provider = model_config
+                
+                # Start with the provider config
+                self.model_config = providers_config[model_config].copy()
+                
+                # Check if we have a default agent config to use for the model, temperature, etc.
+                if "default" in agents_config:
+                    default_config = agents_config["default"]
+                    # Only use the default if it has the same provider
+                    if default_config.get("provider") == model_config:
+                        self.model_config.update(default_config)
+                    else:
+                        self.logger.warning(f"Default agent uses different provider '{default_config.get('provider')}', not applying its settings")
+                else:
+                    self.logger.warning(f"No default agent configuration found, model settings may be incomplete")
+            else:
+                self.logger.warning(f"Provider configuration '{model_config}' not found. Using default agent.")
+                self.model_config, self.provider = self._get_default_agent_config()
         else:
-            self.model_config, self.provider = self._get_default_config()
+            # Fall back to default agent config
+            self.model_config, self.provider = self._get_default_agent_config()
         
-        # Set model parameters
-        self.model = self.model_config.get("model", "gpt-4")
+        # Set model parameters - ensure they exist
+        self.model = self.model_config.get("model")
+        if not self.model:
+            self.logger.warning(f"No model specified for provider {self.provider}, this may cause errors")
+            
         self.temperature = self.model_config.get("temperature", 0.7)
         self.max_tokens = self.model_config.get("max_tokens", 4096)
         self.url = self.model_config.get("url")
@@ -138,57 +194,106 @@ class LLMService:
             {"role": "system", "content": self.system_prompt}
         ]
         
-        self.logger.info(f"Initialized LLM service with provider: {self.provider}, model: {self.model}")
+        if agent_type:
+            self.logger.info(f"Initialized LLM service for {agent_type} agent with provider: {self.provider}, model: {self.model}")
+        else:
+            self.logger.info(f"Initialized LLM service with provider: {self.provider}, model: {self.model}")
         
         # Mark this instance as initialized to avoid re-initialization
         self.initialized = True
     
     def _find_config_path(self) -> str:
-        """Find the models.yaml configuration file."""
+        """Find the config.yml configuration file."""
         # Check current directory
-        if os.path.exists("models.yaml"):
-            return "models.yaml"
+        if os.path.exists("config.yml"):
+            return "config.yml"
         
-        # Check home directory ~/.pwnai/models.yaml
-        home_config = os.path.expanduser("~/.pwnai/models.yaml")
+        # Check home directory ~/.pwnai/config.yml
+        home_config = os.path.expanduser("~/.pwnai/config.yml")
         if os.path.exists(home_config):
             return home_config
         
+        # Check for legacy models.yaml (for backward compatibility)
+        if os.path.exists("models.yaml"):
+            return "models.yaml"
+        
+        # Check home directory ~/.pwnai/models.yaml (for backward compatibility)
+        home_legacy_config = os.path.expanduser("~/.pwnai/models.yaml")
+        if os.path.exists(home_legacy_config):
+            return home_legacy_config
+        
         # Check package directory
-        package_config = os.path.join(os.path.dirname(__file__), "../models.yaml")
+        package_config = os.path.join(os.path.dirname(__file__), "../config.yml")
         if os.path.exists(package_config):
             return package_config
         
+        package_legacy_config = os.path.join(os.path.dirname(__file__), "../models.yaml")
+        if os.path.exists(package_legacy_config):
+            return package_legacy_config
+        
         # Default to /opt as fallback
+        if os.path.exists("/opt/config.yml"):
+            return "/opt/config.yml"
         return "/opt/models.yaml"
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
-        """Load the model configuration from a YAML file."""
+        """Load the configuration from a YAML file."""
         try:
             with open(config_path, 'r') as file:
-                return yaml.safe_load(file)
+                config = yaml.safe_load(file)
+                
+                # Handle the new config.yml format with 'providers' section
+                if "providers" in config:
+                    self.logger.debug("Found 'providers' section in config, using new format")
+                    return {"providers": config["providers"], "agents": config.get("agents", {})}
+                
+                # Handle legacy models.yaml format (backward compatibility)
+                self.logger.debug("No 'providers' section found, assuming legacy format")
+                return {"providers": config, "agents": {}}
+                
         except Exception as e:
-            self.logger.error(f"Error loading model configuration: {str(e)}")
-            return {}
+            self.logger.error(f"Error loading configuration: {str(e)}")
+            return {"providers": {}, "agents": {}}
     
-    def _get_default_config(self) -> tuple:
-        """Get the default model configuration from the config file."""
-        # First, look for a configuration with default: true
-        for provider, config in self.config.items():
-            if config.get("default", False):
-                return config, provider
+    def _get_default_agent_config(self) -> tuple:
+        """Get the default agent configuration from the config file."""
+        agents_config = self.config.get("agents", {})
         
-        # If no default is specified, use OpenAI if it exists
-        if "openai" in self.config:
-            return self.config["openai"], "openai"
+        # First, check for an agent with the name "default"
+        if "default" in agents_config:
+            default_config = agents_config["default"]
+            provider = default_config.get("provider", "unknown")
+            
+            # If the default agent specifies a provider, merge provider settings
+            if provider in self.config.get("providers", {}):
+                # Start with provider settings
+                merged_config = self.config["providers"][provider].copy()
+                # Override with agent settings
+                merged_config.update(default_config)
+                return merged_config, provider
+            else:
+                # Just use the default agent config as is
+                return default_config, provider
         
-        # Otherwise, use the first configuration found
-        if self.config:
-            provider = next(iter(self.config))
-            return self.config[provider], provider
+        # Next, look for an agent config with default: true
+        for agent_name, agent_config in agents_config.items():
+            if agent_config.get("default", False):
+                provider = agent_config.get("provider", "unknown")
+                
+                # If the agent specifies a provider, merge provider settings
+                if provider in self.config.get("providers", {}):
+                    # Start with provider settings
+                    merged_config = self.config["providers"][provider].copy()
+                    # Override with agent settings
+                    merged_config.update(agent_config)
+                    return merged_config, provider
+                else:
+                    # Just use the agent config as is
+                    return agent_config, provider
         
-        # Fallback to empty config
-        return {}, "openai"
+        # Fallback to empty config with warning
+        self.logger.error("No default agent configuration found, this will likely cause errors")
+        return {}, "unknown"
     
     def call(
         self,

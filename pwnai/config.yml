@@ -1,0 +1,56 @@
+# PwnAI Configuration
+# Define different model providers and agent configurations
+
+providers:
+  openai:
+    url: https://api.openai.com/v1
+
+  ollama:
+    url: http://host.docker.internal:11434/api/chat
+    num_ctx: 16384
+
+  ollama_small:
+    url: http://host.docker.internal:11434/api/chat
+    num_ctx: 16384
+
+  gemma3:
+    url: http://host.docker.internal:11434/api/chat
+    num_ctx: 16384
+
+  claude:
+    url: https://api.anthropic.com/v1/messages
+    # Uncomment and set your Anthropic API key here
+    # api_key: your_api_key_here
+
+agents:
+  reversing:
+    provider: claude
+    model: claude-3-7-sonnet-20250219
+    temperature: 0.0
+    system_prompt_prefix: "You are a binary reverse engineering expert. Analyze assembly code, identify vulnerable functions, and classify vulnerabilities with precision."
+  
+  debugging:
+    provider: openai
+    model: gpt-4o
+    temperature: 0.0
+    system_prompt_prefix: "You are a debugging expert specialized in binary exploitation. Focus on finding precise buffer overflow offsets, identifying useful gadgets, and analyzing program crashes."
+  
+  exploitation:
+    provider: claude
+    model: claude-3-7-sonnet-20250219
+    temperature: 0.3
+    system_prompt_prefix: "You are an elite exploitation expert. Craft precise exploits using techniques like ROP, format string attacks, and shellcode injection. Your code should be robust and bypass common protections."
+  
+  writeup:
+    provider: openai
+    model: gpt-4o
+    temperature: 0.7
+    system_prompt_prefix: "You are a technical documentation specialist. Create detailed, educational CTF writeups that explain the vulnerability analysis, exploitation techniques, and key concepts."
+  
+  # Define a default agent config to use when no specific agent is specified
+  default:
+    provider: claude
+    model: claude-3-7-sonnet-20250219
+    temperature: 0.3
+    system_prompt_prefix: "You are a binary exploitation expert assistant helping solve CTF challenges."
+    default: true 

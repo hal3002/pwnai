@@ -711,9 +711,11 @@ class GDBWrapper:
             
         binary_path_str = str(self.binary_path)
         
+        # First try using ldd to find if libc is linked
+        libc_used = False
+        libc_path = None
         try:
-            # Use a different approach that doesn't rely on running the binary
-            # First, check if we can find libc in the loaded libraries without running
+            # Check if we can find libc in the loaded libraries without running
             cmd = ["ldd", binary_path_str]
             self.logger.debug(f"Running ldd command: {cmd}")
             
@@ -729,21 +731,121 @@ class GDBWrapper:
             if result.returncode == 0:
                 for line in result.stdout.splitlines():
                     if "libc.so" in line and "=>" in line:
-                        # Extract the address if present, but this is just for debugging
-                        # The actual base address is determined at runtime
-                        self.logger.debug(f"Found libc in ldd output: {line}")
-                        return 0  # Just indicate that libc is used
-            
-            # If we can't find it with ldd, we'll return None as we can't determine base address
-            self.logger.debug("No libc found in ldd output or not dynamically linked")
-            return None
-            
-        except subprocess.TimeoutExpired:
-            self.logger.warning("ldd command timed out")
-            return None
+                        parts = line.split("=>")
+                        if len(parts) > 1:
+                            path_part = parts[1].strip().split()[0]
+                            if os.path.exists(path_part):
+                                libc_path = path_part
+                                libc_used = True
+                                self.logger.debug(f"Found libc at: {libc_path}")
+                                break
         except Exception as e:
-            self.logger.warning(f"Error checking for libc: {str(e)}")
+            self.logger.warning(f"Error checking for libc with ldd: {str(e)}")
+        
+        # If we didn't find libc being used, no need to continue
+        if not libc_used:
+            self.logger.warning("No libc found or not dynamically linked")
             return None
+            
+        # Now use GDB to determine the actual base address at runtime
+        try:
+            # Prepare GDB commands to find libc base address
+            gdb_commands = [
+                "set pagination off",
+                "set disassembly-flavor intel",
+                "break main",  # Break at main to ensure libc is loaded
+                "run",         # Run the program to hit the breakpoint
+                "info proc mappings",  # Get memory mappings to find libc
+                "quit"
+            ]
+            
+            # Run GDB
+            result = self.run_gdb_commands(gdb_commands)
+            
+            # Parse the output to find libc base address
+            for line in result.splitlines():
+                if libc_path and libc_path in line:
+                    # Found the line with libc mapping
+                    parts = line.strip().split()
+                    # Memory mapping lines typically look like:
+                    # start      end        size       offset     permissions  path
+                    # 0x7ffff7dc6000 0x7ffff7fd0000 0x20a000 0 r-xp /lib/x86_64-linux-gnu/libc-2.31.so
+                    if len(parts) >= 6 and parts[0].startswith("0x"):
+                        libc_base = int(parts[0], 16)
+                        self.logger.info(f"Found libc base address: {hex(libc_base)}")
+                        return libc_base
+                elif "libc" in line.lower() and ".so" in line:
+                    # Found a line that mentions libc
+                    parts = line.strip().split()
+                    if len(parts) >= 6 and parts[0].startswith("0x"):
+                        libc_base = int(parts[0], 16)
+                        self.logger.info(f"Found libc base address: {hex(libc_base)}")
+                        return libc_base
+                        
+            # If no specific libc path, look for any libc-like library
+            for line in result.splitlines():
+                if "libc" in line.lower() and ".so" in line:
+                    parts = line.strip().split()
+                    if len(parts) >= 2 and parts[0].startswith("0x"):
+                        libc_base = int(parts[0], 16)
+                        self.logger.info(f"Found libc base address: {hex(libc_base)}")
+                        return libc_base
+            
+            # If we haven't found it in mappings, try info sharedlibrary output
+            # Prepare GDB commands to find libc base address using info sharedlibrary
+            gdb_commands = [
+                "set pagination off", 
+                "set disassembly-flavor intel",
+                "break main",
+                "run",
+                "info sharedlibrary",
+                "quit"
+            ]
+            
+            # Run GDB
+            result = self.run_gdb_commands(gdb_commands)
+            
+            # Parse the output to find libc base address
+            for line in result.splitlines():
+                if "libc.so" in line:
+                    # Info sharedlibrary format is typically:
+                    # From        To          Syms Read   Shared Object Library
+                    # 0x7ffff7dc6000  0x7ffff7fd0000  Yes         /lib/x86_64-linux-gnu/libc.so.6
+                    parts = line.strip().split()
+                    if len(parts) >= 4 and parts[0].startswith("0x"):
+                        libc_base = int(parts[0], 16)
+                        self.logger.info(f"Found libc base address from sharedlibrary info: {hex(libc_base)}")
+                        return libc_base
+            
+            # If ASLR is disabled and we have PIE disabled, libc might be at a fixed address
+            # Let's just try to find a reasonable default value for testing
+            if not self.check_aslr_enabled() and not self.elf.pie:
+                # Try some common fixed addresses based on architecture
+                if context.arch == "i386":  # 32-bit
+                    default_base = 0xf7000000
+                    self.logger.warning(f"Using default 32-bit libc base address: {hex(default_base)}")
+                    return default_base
+                elif context.arch == "amd64":  # 64-bit
+                    default_base = 0x7ffff7000000
+                    self.logger.warning(f"Using default 64-bit libc base address: {hex(default_base)}")
+                    return default_base
+            
+            self.logger.warning("Could not determine libc base address")
+            return None
+            
+        except Exception as e:
+            self.logger.warning(f"Error determining libc base address: {str(e)}")
+            return None
+            
+    def check_aslr_enabled(self) -> bool:
+        """Check if ASLR is enabled on the system."""
+        try:
+            with open('/proc/sys/kernel/randomize_va_space', 'r') as f:
+                value = int(f.read().strip())
+            return value != 0
+        except Exception:
+            # Default to assuming ASLR is enabled if we can't check
+            return True
     
     def try_exploit(self, payload: bytes, args: Optional[List[str]] = None) -> Tuple[bool, str]:
         """
@@ -809,4 +911,189 @@ class GDBWrapper:
             return False, "Binary still running but no shell detected"
         
         except Exception as e:
-            return False, f"Error during exploit attempt: {str(e)}" 
+            return False, f"Error during exploit attempt: {str(e)}"
+    
+    def find_library_gadgets(self, library_name: str = "libc", pattern: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Find ROP gadgets in shared libraries like libc.
+        
+        Args:
+            library_name: Name of the library (e.g., "libc")
+            pattern: Pattern to search for (e.g., "pop rdi", "ret")
+            
+        Returns:
+            List of gadget dictionaries with real addresses
+        """
+        try:
+            # First get the library base address
+            if library_name.lower() == "libc":
+                library_base = self.get_libc_base()
+                if not library_base:
+                    self.logger.warning("Could not determine libc base address")
+                    return []
+                
+                # Find the libc path
+                libc_path = None
+                if self.elf.libc:
+                    libc_path = self.elf.libc.path
+                else:
+                    # Try to find libc path through ldd
+                    try:
+                        ldd_output = subprocess.check_output(["ldd", str(self.binary_path)], text=True)
+                        for line in ldd_output.splitlines():
+                            if "libc.so" in line:
+                                # Extract the path from the ldd output
+                                parts = line.split("=>")
+                                if len(parts) > 1:
+                                    libc_path = parts[1].strip().split()[0]
+                                    break
+                    except Exception as e:
+                        self.logger.warning(f"Failed to find libc path through ldd: {str(e)}")
+                
+                if not libc_path or not os.path.exists(libc_path):
+                    self.logger.warning(f"Could not find libc at {libc_path}")
+                    return []
+                
+                # Now search for gadgets in the libc file
+                cmd = ["ROPgadget", "--binary", libc_path]
+                if pattern:
+                    # Ensure pattern string is properly formatted
+                    safe_pattern = pattern.replace(";", "\\;")  # Escape semicolons
+                    cmd.extend(["--only", safe_pattern])
+                
+                self.logger.debug(f"Running ROPgadget command on libc: {' '.join(cmd)}")
+                
+                # Run the command with a timeout to prevent hanging
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+                
+                if result.returncode != 0:
+                    self.logger.warning(f"ROPgadget on libc failed: {result.stderr}")
+                    return []
+                
+                # Parse the output to find gadgets
+                gadgets = []
+                for line in result.stdout.splitlines():
+                    if "0x" in line:
+                        # Parse the ROPgadget output format: "0xaddress : instruction"
+                        parts = line.split(" : ")
+                        if len(parts) >= 2:
+                            offset_str = parts[0].strip()
+                            instruction = parts[1].strip()
+                            try:
+                                # This is the offset within libc, add the base address for the real runtime address
+                                offset = int(offset_str, 16)
+                                real_addr = library_base + offset
+                                gadgets.append({
+                                    "address": hex(real_addr),
+                                    "offset": offset_str,
+                                    "instruction": instruction,
+                                    "binary": libc_path,
+                                })
+                            except ValueError:
+                                self.logger.debug(f"Failed to parse gadget offset: {offset_str}")
+                
+                self.logger.info(f"Found {len(gadgets)} gadgets in libc")
+                return gadgets
+            else:
+                # For other libraries, similar approach can be implemented
+                self.logger.warning(f"Finding gadgets in {library_name} not implemented yet")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error finding library gadgets: {str(e)}")
+            return []
+    
+    def find_specific_gadget(self, pattern: str, library: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Find a specific gadget pattern in the binary or library.
+        
+        Args:
+            pattern: Gadget pattern to search for (e.g., "pop rdi; ret")
+            library: Optional library name to search in (e.g., "libc")
+            
+        Returns:
+            Dictionary with gadget information if found, None otherwise
+        """
+        try:
+            self.logger.info(f"Searching for gadget pattern: {pattern}")
+            
+            # Choose where to search based on library parameter
+            if library:
+                gadgets = self.find_library_gadgets(library, pattern)
+            else:
+                gadgets = self._find_raw_gadgets(pattern)
+            
+            # Return the first matching gadget if any found
+            if gadgets:
+                self.logger.info(f"Found gadget: {gadgets[0]['instruction']} at {gadgets[0]['address']}")
+                return gadgets[0]
+                
+            # If no exact match found, try more flexible search
+            if not pattern.endswith("ret") and "ret" not in pattern:
+                # Try searching for the pattern followed by ret
+                modified_pattern = f"{pattern}; ret"
+                self.logger.info(f"Trying alternative pattern: {modified_pattern}")
+                
+                if library:
+                    gadgets = self.find_library_gadgets(library, modified_pattern)
+                else:
+                    gadgets = self._find_raw_gadgets(modified_pattern)
+                
+                if gadgets:
+                    self.logger.info(f"Found alternative gadget: {gadgets[0]['instruction']} at {gadgets[0]['address']}")
+                    return gadgets[0]
+            
+            self.logger.warning(f"No gadget found matching pattern: {pattern}")
+            return None
+                
+        except Exception as e:
+            self.logger.error(f"Error finding specific gadget: {str(e)}")
+            return None
+    
+    def run_gdb_commands(self, commands: List[str]) -> str:
+        """
+        Run a list of GDB commands and return the output.
+        
+        Args:
+            commands: List of GDB commands to execute
+            
+        Returns:
+            Output from GDB
+        """
+        if not commands:
+            return ""
+            
+        # Create a temporary file to hold GDB commands
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            for cmd in commands:
+                f.write(cmd + '\n')
+            script_path = f.name
+            
+        try:
+            # Run GDB with the script
+            gdb_cmd = ["gdb", "--batch", "-x", script_path, str(self.binary_path)]
+            self.logger.debug(f"Running GDB command: {' '.join(gdb_cmd)}")
+            
+            result = subprocess.run(
+                gdb_cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,  # Longer timeout for running GDB
+                check=False
+            )
+            
+            output = result.stdout + result.stderr
+            return output
+            
+        except subprocess.TimeoutExpired:
+            self.logger.warning("GDB command timed out")
+            return ""
+        except Exception as e:
+            self.logger.warning(f"Error running GDB commands: {str(e)}")
+            return ""
+        finally:
+            # Clean up the temporary script file
+            try:
+                os.unlink(script_path)
+            except:
+                pass 

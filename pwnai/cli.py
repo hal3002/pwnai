@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        help="LLM model configuration to use (e.g., 'openai', 'ollama'). Uses default from models.yaml if not specified",
+        help="Default LLM model provider to use (e.g., 'openai', 'claude'). Overrides the default provider in config file.",
     )
     parser.add_argument(
         "--feedback",
@@ -65,45 +65,85 @@ def parse_args():
         type=str,
         help="Path to the source code file of the binary (if available)",
     )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=os.path.expanduser("~/.pwnai/config.yml"),
+        help="Path to the configuration file (default: ~/.pwnai/config.yml)",
+    )
+    parser.add_argument(
+        "--shellcode",
+        type=str,
+        help="Path to a binary file containing shellcode to use in the final stage of the exploit",
+    )
 
     return parser.parse_args()
 
 
-def find_models_config():
-    """Find the models.yaml configuration file.
+def find_config(custom_path=None):
+    """Find the configuration file.
+    
+    Args:
+        custom_path: Custom path to the configuration file specified via command line
     
     Searches in the following locations:
-    1. Current working directory
-    2. ~/.pwnai/models.yaml (user home directory)
-    3. Package-bundled models.yaml
+    1. Custom path from command line argument
+    2. Current working directory (config.yml or models.yaml)
+    3. ~/.pwnai/ directory (config.yml or models.yaml)
+    4. Package-bundled configuration
     """
+    # Check if custom path is provided
+    if custom_path:
+        if os.path.exists(custom_path):
+            return custom_path
+        else:
+            print(f"Warning: Specified config file not found at {custom_path}")
+    
     # Check current directory
+    if os.path.exists("config.yml"):
+        return "config.yml"
+    
+    # Legacy support for models.yaml
     if os.path.exists("models.yaml"):
         return "models.yaml"
     
     # Check user's home directory
-    home_config = os.path.expanduser("~/.pwnai/models.yaml")
+    home_config = os.path.expanduser("~/.pwnai/config.yml")
     if os.path.exists(home_config):
         return home_config
+    
+    # Legacy support for models.yaml in home directory
+    home_legacy = os.path.expanduser("~/.pwnai/models.yaml")
+    if os.path.exists(home_legacy):
+        return home_legacy
     
     # Use package-bundled version
     try:
         # Replace pkg_resources with importlib.resources
         try:
             # For Python 3.9+
+            with importlib.resources.files("pwnai").joinpath("config.yml") as path:
+                if os.path.exists(path):
+                    return str(path)
+            # Try legacy models.yaml
             with importlib.resources.files("pwnai").joinpath("models.yaml") as path:
-                return str(path)
+                if os.path.exists(path):
+                    return str(path)
         except AttributeError:
             # Fallback for Python 3.8 or earlier
-            return str(importlib.resources.path("pwnai", "models.yaml"))
+            if importlib.resources.is_resource("pwnai", "config.yml"):
+                return str(importlib.resources.path("pwnai", "config.yml"))
+            # Try legacy models.yaml
+            if importlib.resources.is_resource("pwnai", "models.yaml"):
+                return str(importlib.resources.path("pwnai", "models.yaml"))
     except Exception as e:
-        print(f"Warning: Could not locate models.yaml: {e}")
+        print(f"Warning: Could not locate configuration file: {e}")
         return None
 
 
 def get_available_models():
     """Get the list of available model configurations."""
-    config_path = find_models_config()
+    config_path = find_config()
     
     if not config_path:
         return ["openai"]  # Fallback to default
@@ -111,9 +151,15 @@ def get_available_models():
     try:
         with open(config_path, 'r') as file:
             config = yaml.safe_load(file)
+            
+            # Check if using new config format with providers section
+            if "providers" in config:
+                return list(config["providers"].keys())
+            
+            # Legacy format
             return list(config.keys())
     except Exception as e:
-        print(f"Warning: Could not load models configuration: {e}")
+        print(f"Warning: Could not load configuration: {e}")
         return ["openai"]  # Fallback to default
 
 
@@ -184,25 +230,28 @@ def main():
             logger.error(f"Invalid remote format: {args.remote}. Use 'host:port'")
             sys.exit(1)
     
-    # Find models.yaml and set up LLM configuration
-    models_config = find_models_config()
-    if models_config:
-        logger.debug(f"Using models configuration from: {models_config}")
-    
-    llm_config = {"model_config": args.model} if args.model else {}
+    # Find config.yml/models.yaml and set up LLM configuration
+    config_path = find_config(args.config)
+    if config_path:
+        logger.debug(f"Using configuration from: {config_path}")
     
     # Initialize the coordinator
     try:
+        # Create base LLM config that will be used by the coordinator
+        base_llm_config = {"model_config": args.model} if args.model else {}
+        base_llm_config["config_path"] = args.config  # Use the specified config file
+        
         coordinator = Coordinator(
             binary_path=str(binary_path),
             output_dir=str(output_dir),
             remote_host=remote_host,
             remote_port=remote_port,
             arch=args.arch,
-            llm_config=llm_config,
             debug=args.debug,
+            llm_config=base_llm_config,
             user_feedback=args.feedback,
-            source_file=args.source
+            source_file=args.source,
+            shellcode_file=args.shellcode
         )
         
         # Initialize and register all agents
@@ -211,19 +260,36 @@ def main():
         # Create initial state for agents
         state = coordinator.state.to_dict()
         
-        # Create a single LLM service instance to be shared by all agents
-        shared_llm_service = LLMService(**(llm_config))
-        logger.debug(f"Created shared LLM service with model config: {args.model or 'default'}")
+        # Create base LLM config with just the model provider override if specified
+        base_llm_config = {"model_config": args.model} if args.model else {}
+        base_llm_config["config_path"] = config_path  # Use the found config file
         
-        # Pass the shared_llm_service directly to the agent constructors
+        logger.debug(f"Using config file: {config_path}")
+        if args.model:
+            logger.debug(f"Overriding default provider with: {args.model}")
+        
+        # Create agent-specific configurations
+        reversing_llm_config = base_llm_config.copy()
+        reversing_llm_config["agent_type"] = "reversing"
+        
+        debugging_llm_config = base_llm_config.copy()
+        debugging_llm_config["agent_type"] = "debugging"
+        
+        exploitation_llm_config = base_llm_config.copy()
+        exploitation_llm_config["agent_type"] = "exploitation"
+        
+        writeup_llm_config = base_llm_config.copy()
+        writeup_llm_config["agent_type"] = "writeup"
+        
+        # Log agent configurations
+        logger.debug(f"Initializing agents with configurations from {config_path}")
         
         # Reversing Agent
         reversing_agent = ReversingAgent(
             state=state,
             binary_path=binary_path,
             output_dir=output_dir,
-            llm_config=llm_config,
-            llm_service=shared_llm_service
+            llm_config=reversing_llm_config
         )
         coordinator.register_agent("reversing", reversing_agent)
         
@@ -232,8 +298,7 @@ def main():
             state=state,
             binary_path=binary_path,
             output_dir=output_dir,
-            llm_config=llm_config,
-            llm_service=shared_llm_service
+            llm_config=debugging_llm_config
         )
         coordinator.register_agent("debugging", debugging_agent)
         
@@ -242,8 +307,7 @@ def main():
             state=state,
             binary_path=binary_path,
             output_dir=output_dir,
-            llm_config=llm_config,
-            llm_service=shared_llm_service
+            llm_config=exploitation_llm_config
         )
         coordinator.register_agent("exploitation", exploitation_agent)
         
@@ -252,8 +316,7 @@ def main():
             state=state,
             binary_path=binary_path,
             output_dir=output_dir,
-            llm_config=llm_config,
-            llm_service=shared_llm_service
+            llm_config=writeup_llm_config
         )
         coordinator.register_agent("writeup", writeup_agent)
         

@@ -102,7 +102,7 @@ case "$ARCH" in
 esac
 
 # Define compiler flags (same as in tests)
-BASE_COMPILER_FLAGS="-fno-stack-protector -no-pie -z execstack"
+BASE_COMPILER_FLAGS="-fno-stack-protector -mpreferred-stack-boundary=2 -z execstack -O0 -no-pie -fno-pic -ggdb"
 
 # Compile the binary
 echo "Compiling $SOURCE_FILE for $ARCH architecture..."

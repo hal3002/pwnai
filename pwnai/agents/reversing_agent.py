@@ -240,7 +240,17 @@ class ReversingAgent(BaseAgent):
                 if vf.get("type") == "imported_vulnerable_function":
                     vuln_funcs_text += f"- Imported: {vf.get('name')} at address {vf.get('address')}\n"
                 elif vf.get("type") == "vulnerable_function_call":
-                    vuln_funcs_text += f"- Call to {vf.get('function')} at address {vf.get('caller_address')}\n"
+                    called_func = vf.get('function', 'unknown')
+                    caller_addr = vf.get('caller_address', 'unknown')
+                    vuln_funcs_text += f"- Call to {called_func} at address {caller_addr}\n"
+                    
+                    # Also add detailed information to help LLM understand
+                    if vf.get('instruction'):
+                        vuln_funcs_text += f"  Instruction: {vf.get('instruction')}\n"
+                    if vf.get('disassembly'):
+                        vuln_funcs_text += f"  Context:\n"
+                        for line in vf.get('disassembly', '').split('\n')[:5]:  # First 5 lines of context
+                            vuln_funcs_text += f"    {line}\n"
         
         # Format strings (only include potentially interesting ones)
         strings = report.get("strings", [])
